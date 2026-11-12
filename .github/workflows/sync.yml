@@ -1,0 +1,74 @@
+name: Sync to GitLab
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview planned sync actions without making changes
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-to-gitlab-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' || vars.SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Reject debug logging
+        if: runner.debug == '1'
+        shell: bash
+        run: |
+          echo "::error::Disable GitHub Actions step and runner debug logging before running the sync."
+          exit 1
+
+      - name: Check exclusion configuration
+        if: success() && runner.debug != '1' && vars.EXCLUDE_REPOS != ''
+        shell: bash
+        run: |
+          echo "::error::Move EXCLUDE_REPOS to an Actions repository secret and remove the old Actions variable before running the sync."
+          exit 1
+
+      - name: Check out the sync code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Ensure Git LFS is available
+        shell: bash
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes git-lfs
+          fi
+          git lfs version
+
+      - name: Sync repositories
+        shell: bash
+        env:
+          SOURCE_ORG: ${{ vars.SOURCE_ORG || 'ieasybooks' }}
+          GITLAB_GROUP_ID: ${{ vars.GITLAB_GROUP_ID }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
+          EXCLUDE_REPOS: ${{ secrets.EXCLUDE_REPOS }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          args=()
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/sync.py "${args[@]}"
