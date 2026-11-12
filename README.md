@@ -32,6 +32,7 @@ Add these repository **secrets**:
 | --- | --- | --- |
 | `GITLAB_TOKEN` | Yes | The GitLab personal access token from step 2. |
 | `GH_READ_TOKEN` | For private or internal GitHub repositories | A GitHub token with read access to the repositories to mirror. Omit it to use the workflow's built-in token for public source repositories. |
+| `EXCLUDE_REPOS` | No | Comma-separated source repository names or `owner/name` entries to skip, for example `old-experiment,ieasybooks/large-dataset`. Matching is case-insensitive. Store this as a secret because it can contain private repository names. |
 
 Add these repository **variables** on the **Variables** tab:
 
@@ -40,19 +41,20 @@ Add these repository **variables** on the **Variables** tab:
 | `GITLAB_GROUP_ID` | Yes | The numeric ID of the GitLab destination group. |
 | `SYNC_ENABLED` | To enable scheduled runs | Set to `true` after validating a manual sync. Leave unset while setting up. |
 | `SOURCE_ORG` | No | Defaults to `ieasybooks`. |
-| `EXCLUDE_REPOS` | No | Comma-separated source repository names or `owner/name` entries to skip, for example `old-experiment,ieasybooks/large-dataset`. Matching is case-insensitive. |
 
-For private or internal source repositories, **make this GitHub automation repository private first**. This is separate from the public GitLab destination group: Actions logs and summaries can identify the mirrored repositories. The script refuses to process non-public source repositories from a public Actions repository.
+**This GitHub automation repository can remain public, including when it mirrors private source repositories.** Sync logs and summaries use aliases such as `repo-001`; see [Logs and local diagnosis](#logs-and-local-diagnosis) for what remains visible.
 
-Then create a GitHub fine-grained personal access token with:
+For private or internal sources, create a GitHub fine-grained personal access token with:
 
 - **Resource owner:** `ieasybooks`, or the organization selected by `SOURCE_ORG`.
 - **Repository access:** all repositories you want mirrored. Choose **All repositories** to include newly created repositories automatically.
 - **Repository permissions:** **Contents: read-only** and **Metadata: read-only**.
 
-Complete any organization approval or SSO requirements GitHub presents, and save the token as `GH_READ_TOKEN`. Ensure it can also read this automation repository, which the privacy check inspects. Without this optional secret, other private repositories are not discoverable through the built-in `GITHUB_TOKEN`.
+Complete any organization approval or SSO requirements GitHub presents, and save the token as `GH_READ_TOKEN`. Without this optional secret, other private repositories are not discoverable through the built-in `GITHUB_TOKEN`.
 
 Visibility preservation needs no additional secret or variable. Keep any existing `GITLAB_TOKEN` and `GITLAB_GROUP_ID` values when using the same destination group.
+
+`SOURCE_ORG` and `GITLAB_GROUP_ID` are public configuration and can appear in GitHub's workflow environment display. Repository exclusions belong in a secret. If you previously configured `EXCLUDE_REPOS` as a **Variable**, copy its value into a repository **Secret** with the same name, then delete the old variable **before starting another workflow run**. Keep debug logging disabled during this migration: runner diagnostics can serialize plaintext variables before any job step, and changing configuration does not remove existing logs. The workflow also refuses to run while the legacy variable exists, even if the secret is present, so the old exclusion list cannot be silently ignored.
 
 ### 4. Preview the destination
 
@@ -60,7 +62,7 @@ After the implementation PR is merged into `main`:
 
 1. Open **Actions → Sync to GitLab → Run workflow**.
 2. Select `main` and leave **dry_run** checked.
-3. Review the printed destination group path and numeric ID, source count, repository create/update actions, and target visibility. Confirm they match the intended destination and scope.
+3. Confirm that the configured `GITLAB_GROUP_ID` selects the intended destination. Review the run's counts, repository aliases, create/update actions, and target visibility. Use a local named dry run if you need to inspect the repository names.
 
 A dry run only reads GitHub and GitLab APIs. It does not create projects, change project settings, remove protections, or transfer Git/LFS objects. It therefore cannot verify every permission needed by the eventual write operations.
 
@@ -115,9 +117,9 @@ Do not use a mirror for independent GitLab development: its branches and tags ca
 
 ## Operation and troubleshooting
 
-- **Scheduling:** GitHub Actions schedules can be delayed or dropped during high load. Scheduled workflows in a public repository are also disabled after 60 days without repository activity. Monitor the workflow, or use a private automation repository to avoid that specific public-repository inactivity rule.
+- **Scheduling:** GitHub Actions schedules can be delayed or dropped during high load. Scheduled workflows in a public repository are also disabled after 60 days without repository activity. Monitor the workflow and re-enable it if GitHub disables it; this repository does not create automatic heartbeat commits.
 - **Concurrency:** One sync run executes at a time. Starting another run does not cancel the active transfer.
-- **Failures:** Check the failed Actions run for the affected repository and error. A repository failure is recorded while other repositories continue; any failure makes the run unsuccessful. Resolve the cause and rerun the workflow; existing managed projects are reused. Configure your GitHub Actions notification preferences to receive workflow failure notifications.
+- **Failures:** Check the failed Actions run for the affected repository alias and error code. A repository failure is recorded while other repositories continue; any failure makes the run unsuccessful. Use local named output when you need to identify a repository, then resolve the cause and rerun the workflow; existing managed projects are reused. Configure your GitHub Actions notification preferences to receive workflow failure notifications.
 - **Authentication errors:** Check token expiration, the selected GitHub repositories, any organization token approvals, and the GitLab account's access to the group. Replace expired tokens in the corresponding GitHub secret.
 - **Existing project collision:** Use a clean destination group or rename the unrelated GitLab project. The script deliberately does not adopt unrelated projects.
 - **Public visibility rejected:** Confirm that the destination group is Public and the token's account can manage project visibility. The script reports restrictions and keeps the affected mirror private rather than changing group-wide settings.
@@ -128,6 +130,16 @@ Do not use a mirror for independent GitLab development: its branches and tags ca
 
 The sync does not require paid GitLab pull mirroring or a workflow file in each source repository. It runs using Python's standard library, Git, and Git LFS. Official GitHub Actions are pinned to commit SHAs, with Dependabot configured to propose updates.
 
+### Logs and local diagnosis
+
+By default, each repository is represented by an alias such as `repo-001`. These aliases are assigned per run and are not stable identifiers. Default script output and all job summaries contain fixed status/error messages, visibility, and counts rather than private repository names, repository IDs, paths, URLs, refs, content, credentials, raw API/Git errors, or tracebacks. The workflow does not upload private repository data as artifacts or cache it between runs.
+
+Public logs still reveal counts, statuses, visibility states, and timing. GitHub also displays its own run metadata and the public organization/group configuration described above. Aliased output does not conceal those facts.
+
+Keep Actions debug logging disabled. The workflow stops when runner debug mode is enabled, before the steps that use sync credentials or exclusions. The script also rejects Actions runs with `RUNNER_DEBUG=1`, `ACTIONS_STEP_DEBUG=true`, or `ACTIONS_RUNNER_DEBUG=true`.
+
+For repository names during local diagnosis, use `--show-repository-names` outside GitHub Actions. This flag is rejected in Actions, even for a private automation repository. It enables names in terminal output while retaining fixed, sanitized messages; any job summary still uses aliases.
+
 ## Local use and tests
 
 Install Python 3.12+, Git, and Git LFS. Supply `GITLAB_TOKEN` and, when needed, `GH_TOKEN` through your terminal environment or secret manager; tokens must not be committed to the repository. Set `GITLAB_GROUP_ID`, and optionally `SOURCE_ORG` and `EXCLUDE_REPOS`, in the same environment.
@@ -136,6 +148,12 @@ Preview:
 
 ```sh
 python3 scripts/sync.py --dry-run
+```
+
+Preview with repository names on your own machine:
+
+```sh
+python3 scripts/sync.py --dry-run --show-repository-names
 ```
 
 Run a sync:

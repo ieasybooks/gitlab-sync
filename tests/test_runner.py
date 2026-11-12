@@ -320,17 +320,20 @@ class SyncRunnerTests(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(self.events, [])
 
-    def test_private_sources_are_rejected_before_public_actions_logs_or_writes(self):
+    def test_private_sources_sync_from_public_actions_without_probing_the_sync_repository(self):
         private_source = source("private-project", private=True)
         github = RecordingGitHub([private_source], automation_private=False)
+        github.automation_is_private = mock.Mock(side_effect=AssertionError("Unexpected self-repository probe"))
         with mock.patch.dict(
             os.environ,
             {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "ieasybooks/gitlab-sync"},
         ):
-            with self.assertRaises(SyncError):
-                self.run_sync([private_source], github=github)
-        self.assertEqual(self.events, [])
-        self.assertEqual(self.factory_calls, [])
+            results = self.run_sync([private_source], github=github)
+        self.assertEqual([result.status for result in results], ["synced"])
+        self.assertEqual(self.gitlab.values[0]["visibility"], "private")
+        self.assertEqual(len(self.factory_calls), 1)
+        github.automation_is_private.assert_not_called()
+        self.assertNotIn(private_source.full_name, self.output.getvalue())
 
     def test_public_source_is_staged_private_then_published_after_verification_and_refresh(self):
         repository = source()
@@ -488,17 +491,19 @@ class SyncRunnerTests(unittest.TestCase):
                 self.assertEqual(self.gitlab.values[0]["visibility"], "private")
                 self.assertNotIn(("visibility", 50, "public"), self.events)
 
-    def test_public_orchestrator_hides_a_private_sources_existing_mirror_before_aborting(self):
+    def test_public_orchestrator_hides_and_syncs_a_private_sources_existing_mirror(self):
         repository = source("now-private", private=True)
         github = RecordingGitHub([repository], automation_private=False)
+        github.automation_is_private = mock.Mock(side_effect=AssertionError("Unexpected self-repository probe"))
         with mock.patch.dict(
             os.environ,
             {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "ieasybooks/gitlab-sync"},
         ):
-            with self.assertRaises(SyncError):
-                self.run_sync([repository], [project(repository, visibility="public")], github=github)
+            results = self.run_sync([repository], [project(repository, visibility="public")], github=github)
+        self.assertEqual([result.status for result in results], ["synced"])
         self.assertEqual(self.gitlab.values[0]["visibility"], "private")
-        self.assertEqual(self.factory_calls, [])
+        self.assertEqual(len(self.factory_calls), 1)
+        github.automation_is_private.assert_not_called()
         self.assertNotIn(repository.full_name, self.output.getvalue())
 
     def test_lost_publication_response_triggers_an_actual_private_rollback_request(self):

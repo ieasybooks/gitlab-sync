@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.sync import GitMirror, SyncError
 
@@ -159,6 +160,30 @@ class GitMirrorIntegrationTests(unittest.TestCase):
             mirror.push_refs(prune=True)
             mirror.verify()
         self.assertEqual(self.all_refs(self.destination), {"refs/tags/archive": tag})
+
+    def test_git_environment_removes_trace_progress_and_injected_config_variables(self):
+        self.commit("Initial version")
+        output_path = self.root / "must-not-be-written.log"
+        variables = {
+            "GIT_TRACE": str(output_path),
+            "GIT_TRACE_PACKET": str(output_path),
+            "GIT_TRACE_CURL": str(output_path),
+            "GIT_TRACE2": str(output_path),
+            "GIT_TRACE2_EVENT": str(output_path),
+            "GIT_CURL_VERBOSE": "1",
+            "GIT_TRANSFER_TRACE": "1",
+            "GIT_LFS_PROGRESS": str(output_path),
+            "GIT_CONFIG_PARAMETERS": "invalid injected config must be ignored",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": "canary-private-config-value",
+        }
+        with mock.patch.dict(os.environ, variables):
+            with self.mirror() as mirror:
+                self.assertEqual(set(mirror.refs), {"refs/heads/main"})
+                for variable in variables:
+                    self.assertNotIn(variable, mirror.env)
+        self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":

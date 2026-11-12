@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Preview the repositories and destination without making changes
+        description: Preview planned sync actions without making changes
         type: boolean
         required: true
         default: true
@@ -24,6 +24,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      - name: Reject debug logging
+        if: runner.debug == '1'
+        shell: bash
+        run: |
+          echo "::error::Disable GitHub Actions step and runner debug logging before running the sync."
+          exit 1
+
+      - name: Check exclusion configuration
+        if: success() && runner.debug != '1' && vars.EXCLUDE_REPOS != ''
+        shell: bash
+        run: |
+          echo "::error::Move EXCLUDE_REPOS to an Actions repository secret and remove the old Actions variable before running the sync."
+          exit 1
+
       - name: Check out the sync code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,7 +64,7 @@ jobs:
           GITLAB_GROUP_ID: ${{ vars.GITLAB_GROUP_ID }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
-          EXCLUDE_REPOS: ${{ vars.EXCLUDE_REPOS }}
+          EXCLUDE_REPOS: ${{ secrets.EXCLUDE_REPOS }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           args=()
