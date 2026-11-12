@@ -72,11 +72,66 @@ class ApiTests(unittest.TestCase):
         body = json.loads(request.data)
         self.assertEqual(request.method, "POST")
         self.assertEqual(body["namespace_id"], 42)
+        self.assertEqual(body["name"], "books")
+        self.assertEqual(body["path"], "books")
         self.assertEqual(body["visibility"], "private")
         self.assertIs(body["initialize_with_readme"], False)
         self.assertEqual(body["builds_access_level"], "disabled")
         self.assertIs(body["auto_devops_enabled"], False)
         self.assertEqual(sync.project_source_key(body), repository.key)
+
+    def test_github_metadata_repository_gets_a_valid_name_and_path_without_changing_source_identity(self):
+        repository = source(".github", repository_id=10)
+        api = sync.GitLabAPI("gitlab-test-token")
+        api.opener = mock.Mock()
+        api.opener.open.return_value = response(project(repository, path="github-repo-10"))
+
+        api.create_project(repository, 42)
+
+        api.opener.open.assert_called_once()
+        body = json.loads(api.opener.open.call_args.args[0].data)
+        self.assertEqual((body["name"], body["path"]), ("github-repo-10", "github-repo-10"))
+        self.assertEqual(sync.project_source_key(body), repository.key)
+        self.assertIn("https://github.com/ieasybooks/.github", body["description"])
+        self.assertEqual(repository.clone_url, "https://github.com/ieasybooks/.github.git")
+
+    def test_project_creation_preserves_supported_names(self):
+        for name in ("arabi.tools", "faqieh-web-app", "Books_2", "tool42"):
+            with self.subTest(name=name):
+                repository = source(name)
+                api = sync.GitLabAPI("gitlab-test-token")
+                api.opener = mock.Mock()
+                api.opener.open.return_value = response(project(repository))
+                api.create_project(repository, 42)
+                body = json.loads(api.opener.open.call_args.args[0].data)
+                self.assertEqual((body["name"], body["path"]), (name, name))
+
+    def test_project_creation_uses_stable_id_fallback_for_incompatible_names(self):
+        names = (
+            "new", "TrEe", "books.git", "books.ATOM", "_books", "books_",
+            "books__tools", "books.-tools", "books..tools", "GitHub-Repo-99",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                repository = source(name, repository_id=10)
+                api = sync.GitLabAPI("gitlab-test-token")
+                api.opener = mock.Mock()
+                api.opener.open.return_value = response(project(repository, path="github-repo-10"))
+                api.create_project(repository, 42)
+                body = json.loads(api.opener.open.call_args.args[0].data)
+                self.assertEqual((body["name"], body["path"]), ("github-repo-10", "github-repo-10"))
+                self.assertEqual(sync.project_source_key(body), repository.key)
+
+    def test_project_validation_failure_is_not_retried_under_another_name(self):
+        api = sync.GitLabAPI("gitlab-test-token")
+        api.opener = mock.Mock()
+        api.opener.open.side_effect = HTTPError(
+            "https://gitlab.com/api/v4/projects", 400, "Bad Request", {},
+            io.BytesIO(b'{"message":{"name":["is invalid"]}}'),
+        )
+        with self.assertRaises(sync.ApiError):
+            api.create_project(source(".github", repository_id=10), 42)
+        api.opener.open.assert_called_once()
 
     def test_managed_project_is_made_private_before_git_push_without_renaming_its_path(self):
         repository = source("renamed", private=True)
