@@ -31,6 +31,7 @@ class ApiTests(unittest.TestCase):
                 "owner": {"id": 118078313, "login": "ieasybooks"},
                 "default_branch": "main",
                 "private": index == 100,
+                "visibility": "private" if index == 100 else "public",
             }
             for index in range(101)
         ]
@@ -78,11 +79,14 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(sync.project_source_key(body), repository.key)
 
     def test_managed_project_is_made_private_before_git_push_without_renaming_its_path(self):
-        repository = source("renamed")
+        repository = source("renamed", private=True)
         existing = project(repository, path="original-name")
         existing.update(visibility="public", builds_access_level="enabled")
         api = sync.GitLabAPI("gitlab-test-token")
-        with mock.patch.object(api, "request", return_value=existing) as request:
+        def update(method, path, *, body):
+            return {**existing, **body}
+
+        with mock.patch.object(api, "request", side_effect=update) as request:
             api.prepare_project(existing, repository)
         self.assertEqual(request.call_args.args, ("PUT", "/projects/50"))
         body = request.call_args.kwargs["body"]
@@ -90,6 +94,80 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["builds_access_level"], "disabled")
         self.assertNotIn("path", body)
         self.assertNotIn("namespace_id", body)
+
+    def test_fresh_metadata_rejects_malformed_flags_and_treats_conflicts_as_private(self):
+        valid = {
+            "id": 10,
+            "name": "books",
+            "full_name": "ieasybooks/books",
+            "owner": {"id": 118078313, "login": "ieasybooks"},
+            "default_branch": "main",
+            "private": False,
+            "visibility": "public",
+        }
+        api = sync.GitHubAPI("github-test-token")
+        with mock.patch.object(api, "request", return_value=valid) as request:
+            repository = api.repository("ieasybooks/books")
+            self.assertFalse(repository.private)
+            self.assertEqual(repository.id, 10)
+            request.assert_called_once_with("GET", "/repos/ieasybooks/books")
+        invalid_records = [
+            {**valid, "private": None},
+            {**valid, "private": "false"},
+            {**valid, "private": 0},
+            {**valid, "visibility": "unknown"},
+            {key: value for key, value in valid.items() if key != "private"},
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record):
+                with mock.patch.object(api, "request", return_value=record):
+                    with self.assertRaises(sync.SyncError):
+                        api.repository("ieasybooks/books")
+        for record in (
+            {**valid, "visibility": "private"},
+            {**valid, "private": True},
+            {**valid, "visibility": "internal"},
+        ):
+            with self.subTest(ambiguous_or_internal=record):
+                with mock.patch.object(api, "request", return_value=record):
+                    self.assertTrue(api.repository("ieasybooks/books").private)
+
+    def test_visibility_update_changes_the_passed_project_and_checks_the_server_response(self):
+        api = sync.GitLabAPI("gitlab-test-token")
+        existing = project(source())
+        updated = {**existing, "visibility": "public"}
+        with mock.patch.object(api, "request", return_value=updated) as request:
+            result = api.set_visibility(existing, "public")
+        self.assertEqual(existing["visibility"], "public")
+        self.assertEqual(result["visibility"], "public")
+        request.assert_called_once_with("PUT", "/projects/50", body={"visibility": "public"})
+
+        for returned_visibility in ("private", "internal", None):
+            with self.subTest(returned_visibility=returned_visibility):
+                existing = project(source())
+                invalid = {**existing, "visibility": returned_visibility}
+                with mock.patch.object(api, "request", return_value=invalid):
+                    with self.assertRaises(sync.SyncError):
+                        api.set_visibility(existing, "public")
+
+    def test_preparation_preserves_public_only_history_and_never_clears_private_history(self):
+        public_source = source()
+        for history_source, visibility in ((public_source, "public"), (source(private=True), "private")):
+            with self.subTest(expected_visibility=visibility):
+                existing = project(history_source, visibility="public")
+                existing["builds_access_level"] = "enabled"
+                api = sync.GitLabAPI("gitlab-test-token")
+
+                def update(method, path, *, body):
+                    return {**existing, **body}
+
+                with mock.patch.object(api, "request", side_effect=update) as request:
+                    result = api.prepare_project(existing, public_source)
+                self.assertEqual(result["visibility"], visibility)
+                self.assertEqual(
+                    sync.visibility_history(result),
+                    "public-only" if visibility == "public" else "private-history",
+                )
 
     def test_unprotect_refuses_inherited_rules_and_url_encodes_project_rule_names(self):
         api = sync.GitLabAPI("gitlab-test-token")

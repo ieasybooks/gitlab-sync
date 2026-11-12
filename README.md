@@ -2,15 +2,19 @@
 
 Keep the repositories in `ieasybooks` mirrored into one GitLab.com group, using GitLab Free. One scheduled GitHub Actions workflow discovers repositories, creates missing GitLab projects, and copies their branches, tags, commit history, and Git LFS objects.
 
-GitHub is the source of truth. Work in the GitHub repositories; treat the GitLab projects as managed copies. All destination projects are private, and GitLab CI/CD is disabled on them.
+GitHub is the source of truth. Work in the GitHub repositories; treat the GitLab projects as managed copies. New mirrors preserve source visibility: public GitHub repositories become public GitLab projects; private or internal repositories stay private. A mirror created or used for private sources needs a fresh replacement before publication, as described below. GitLab CI/CD is disabled on all mirrors.
 
 ## Setup
 
 ### 1. Choose a GitLab group
 
-Create or choose a group on **GitLab.com** for the mirrors. Use a dedicated group so it is clear which projects the automation manages. Copy its numeric **Group ID** from the group's details/settings page.
+Create or choose a dedicated **Public** group on **GitLab.com** for the mirrors. A public GitLab group can contain both public and private projects; a private group cannot contain public mirrors.
 
-The GitLab account used for automation must be able to create projects in this group and manage those projects. An Owner of a dedicated destination group satisfies these requirements. GitLab Premium and its built-in pull mirroring feature are not required.
+If the destination group is currently private, open **Settings → General → Naming, description, visibility**, set **Visibility level** to **Public**, and select **Save changes**. The automation reports visibility restrictions and does not change group settings for you.
+
+On the group overview, select **Actions → Copy Group ID** to copy its numeric ID.
+
+The GitLab account used for automation must be an **Owner of the destination group** so it can create projects and change their visibility. If you created the group, your account already has this role. GitLab Premium and its built-in pull mirroring feature are not required.
 
 ### 2. Create a GitLab token
 
@@ -27,7 +31,7 @@ Add these repository **secrets**:
 | Secret | Required | Value |
 | --- | --- | --- |
 | `GITLAB_TOKEN` | Yes | The GitLab personal access token from step 2. |
-| `GH_READ_TOKEN` | For private GitHub repositories | A GitHub token with read access to the repositories to mirror. Omit it to use the workflow's built-in token for public source repositories. |
+| `GH_READ_TOKEN` | For private or internal GitHub repositories | A GitHub token with read access to the repositories to mirror. Omit it to use the workflow's built-in token for public source repositories. |
 
 Add these repository **variables** on the **Variables** tab:
 
@@ -38,7 +42,7 @@ Add these repository **variables** on the **Variables** tab:
 | `SOURCE_ORG` | No | Defaults to `ieasybooks`. |
 | `EXCLUDE_REPOS` | No | Comma-separated source repository names or `owner/name` entries to skip, for example `old-experiment,ieasybooks/large-dataset`. Matching is case-insensitive. |
 
-For private source repositories, **make this automation repository private first**. Actions logs and summaries can identify the mirrored repositories. The script refuses to process private source repositories from a public Actions repository.
+For private or internal source repositories, **make this GitHub automation repository private first**. This is separate from the public GitLab destination group: Actions logs and summaries can identify the mirrored repositories. The script refuses to process non-public source repositories from a public Actions repository.
 
 Then create a GitHub fine-grained personal access token with:
 
@@ -48,13 +52,15 @@ Then create a GitHub fine-grained personal access token with:
 
 Complete any organization approval or SSO requirements GitHub presents, and save the token as `GH_READ_TOKEN`. Ensure it can also read this automation repository, which the privacy check inspects. Without this optional secret, other private repositories are not discoverable through the built-in `GITHUB_TOKEN`.
 
+Visibility preservation needs no additional secret or variable. Keep any existing `GITLAB_TOKEN` and `GITLAB_GROUP_ID` values when using the same destination group.
+
 ### 4. Preview the destination
 
 After the implementation PR is merged into `main`:
 
 1. Open **Actions → Sync to GitLab → Run workflow**.
 2. Select `main` and leave **dry_run** checked.
-3. Review the printed destination group path and numeric ID, source count, and repository create/update actions. Confirm they match the intended destination and scope.
+3. Review the printed destination group path and numeric ID, source count, repository create/update actions, and target visibility. Confirm they match the intended destination and scope.
 
 A dry run only reads GitHub and GitLab APIs. It does not create projects, change project settings, remove protections, or transfer Git/LFS objects. It therefore cannot verify every permission needed by the eventual write operations.
 
@@ -72,21 +78,34 @@ Scheduled runs are then requested every hour at minute **17**, in UTC. Every run
 | Branches and tags | Added and updated; source force pushes and deleted refs are reflected in the managed destination. |
 | Default branch | Set to the source default branch before an obsolete destination default branch is removed. |
 | Git LFS objects | Fetched from GitHub and pushed to GitLab explicitly. |
-| New source repositories | Create a private destination project on the next run. |
+| Source visibility | Public sources become public mirrors when created fresh or known to have received only public source data; private and internal sources become private mirrors. |
+| New source repositories | Create a private project first, then apply source visibility after a successful sync and a fresh source check. |
 | GitHub repository renamed | Reuse the project tracked by the source repository ID; retain its existing GitLab path. |
-| Source repository deleted, transferred away, excluded, or no longer accessible | Leave its GitLab project in place. The automation never deletes whole projects. |
+| Source repository deleted, transferred away, excluded, or no longer accessible | Retain the managed GitLab project and make it private. The automation never deletes whole projects. |
 | Issues, pull requests, reviews, comments, release notes/assets, wikis, packages, and organization settings | Not synchronized. |
 | GitHub Actions workflow files | Copied as repository files. They do not execute on GitLab; destination GitLab CI/CD is disabled. |
 
 Only branch and tag refs are synchronized. GitHub's internal pull-request refs are not pushed to GitLab. Submodule entries are copied as part of Git history; their URLs are not rewritten, so mirroring a parent repository does not make its submodules use GitLab automatically.
 
+Pruning a branch or tag does not securely erase previously transferred Git or LFS objects.
+
 The script compares advertised branch/tag refs and the default branch before downloading repository data. If they already match, it reports `unchanged` and skips Git/LFS transfers. A changed repository is fetched into a fresh temporary bare repository; no source files are checked out or executed. LFS objects are uploaded before refs, and successful transfers are checked against the fetched source snapshot. An `unchanged` result is a ref comparison, not a full LFS integrity audit.
+
+Public source Git and LFS transfers use anonymous access; GitHub API discovery still uses the configured read token.
 
 ### Managed project behavior
 
 The automation marks each created project's description with its GitHub source identity. It will only update projects it recognizes as its own mirrors, and it refuses to overwrite an unrelated existing project with the same path. Keep that identity marker in the destination description.
 
-Managed mirrors stay private with GitLab CI/CD disabled. When applying Git changes, project-level protected branch and tag rules are removed on those mirrors so source force pushes and ref deletions can be replicated. Group-level restrictions are not changed; an inherited restriction that blocks synchronization is reported as a failure.
+New mirrors start private. Changed public mirrors are temporarily made private while data is transferred, then published only after a successful sync and a fresh GitHub identity/visibility check. Unchanged public mirrors stay public. Private and internal sources remain private, and a per-repository failure keeps or returns the managed mirror to private. Excluded or undiscovered managed mirrors are also retained as private projects.
+
+The project description permanently records private source history before any private data transfer. Changing the source from private to public does not publish that existing mirror, even if its current refs match. Older mirrors without a visibility history marker are treated the same way. These cases remain private and report that a fresh destination is required, because GitLab can retain objects that are no longer referenced by current branches or tags.
+
+To replace such a mirror, pause the schedule and wait for any active run to finish. Keep the old project **Private**, rename its path to an unused archival name, and remove both the `[github-sync:v1 ...]` and `[github-sync:visibility-v1 ...]` marker lines from its description. You may also archive it. Leave the source-named destination path empty and run the sync so it creates a new managed project. Re-enable the schedule after verifying the replacement. The retired project and its stored history remain private.
+
+Visibility updates follow hourly runs, not instantly; a failed or unrun job cannot guarantee GitLab reflects the latest GitHub privacy setting.
+
+GitLab CI/CD stays disabled on managed mirrors. When applying Git changes, project-level protected branch and tag rules are removed on those mirrors so source force pushes and ref deletions can be replicated. Group-level restrictions are not changed; an inherited restriction that blocks synchronization is reported as a failure.
 
 An empty new repository gets an empty mirror. If a previously populated source unexpectedly advertises no branches or tags, the script keeps the populated destination and reports a failure for review instead of erasing its refs.
 
@@ -101,6 +120,7 @@ Do not use a mirror for independent GitLab development: its branches and tags ca
 - **Failures:** Check the failed Actions run for the affected repository and error. A repository failure is recorded while other repositories continue; any failure makes the run unsuccessful. Resolve the cause and rerun the workflow; existing managed projects are reused. Configure your GitHub Actions notification preferences to receive workflow failure notifications.
 - **Authentication errors:** Check token expiration, the selected GitHub repositories, any organization token approvals, and the GitLab account's access to the group. Replace expired tokens in the corresponding GitHub secret.
 - **Existing project collision:** Use a clean destination group or rename the unrelated GitLab project. The script deliberately does not adopt unrelated projects.
+- **Public visibility rejected:** Confirm that the destination group is Public and the token's account can manage project visibility. The script reports restrictions and keeps the affected mirror private rather than changing group-wide settings.
 - **Protection or push rejection:** Check inherited GitLab group restrictions and destination storage limits. The automation will not change group-wide policies.
 - **Ref name conflict:** Renaming a branch from `foo` to `foo/bar` can make the first push fail while the old destination ref still exists. Remove only the conflicting obsolete ref in the dedicated mirror, then rerun; the script does not perform broad cleanup to resolve these conflicts.
 - **Disable the schedule:** Remove `SYNC_ENABLED` or change it to `false`. This does not delete any mirrored data.
@@ -140,6 +160,7 @@ The pull-request CI workflow runs the checks without accessing the sync secrets 
 - [GitHub scheduled workflow behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 - [GitHub repository mirroring and Git LFS](https://docs.github.com/en/repositories/creating-and-managing-repositories/duplicating-a-repository)
 - [GitLab project creation API](https://docs.gitlab.com/api/projects/#create-a-project)
+- [GitLab project and group visibility](https://docs.gitlab.com/user/public_access/)
 - [GitLab personal access tokens](https://docs.gitlab.com/user/profile/personal_access_tokens/)
 - [GitLab access token scopes](https://docs.gitlab.com/security/tokens/access_token_scopes/)
 - [GitLab group access token availability](https://docs.gitlab.com/user/group/settings/group_access_tokens/)

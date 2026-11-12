@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mirror a GitHub organization to private projects on GitLab.com Free.
+"""Mirror a GitHub organization to GitLab.com Free, preserving visibility.
 
 Only branches and tags are synchronized. GitHub is authoritative; GitLab project
 metadata and host-specific refs are not treated as Git data. No third-party
@@ -90,17 +90,21 @@ class SourceRepository:
 
 
 MARKER = re.compile(r"^\[github-sync:v1 owner_id=(\d+) repository_id=(\d+)\]$", re.MULTILINE)
+VISIBILITY_MARKER = re.compile(
+    r"^\[github-sync:visibility-v1 (public-only|private-history)\]$", re.MULTILINE
+)
 
 
 def source_marker(source: SourceRepository) -> str:
     return f"[github-sync:v1 owner_id={source.owner_id} repository_id={source.id}]"
 
 
-def project_description(source: SourceRepository) -> str:
+def project_description(source: SourceRepository, private_history: bool | None = None) -> str:
+    history = "private-history" if source.private or private_history else "public-only"
     return (
         f"Mirror of https://github.com/{source.full_name}\n\n"
         "Managed by ieasybooks/gitlab-sync. Make changes on GitHub.\n"
-        f"{source_marker(source)}"
+        f"{source_marker(source)}\n[github-sync:visibility-v1 {history}]"
     )
 
 
@@ -109,6 +113,13 @@ def project_source_key(project: dict) -> tuple[int, int] | None:
     if len(matches) > 1:
         raise SyncError(f"GitLab project {project['id']} contains multiple ownership markers.")
     return tuple(map(int, matches[0])) if matches else None
+
+
+def visibility_history(project: dict) -> str | None:
+    matches = VISIBILITY_MARKER.findall(project.get("description") or "")
+    if len(matches) > 1:
+        raise SyncError("The mirror contains conflicting visibility-history markers.")
+    return matches[0] if matches else None
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -181,22 +192,41 @@ class GitHubAPI(ApiClient):
             headers["Authorization"] = f"Bearer {token}"
         super().__init__("https://api.github.com", "GitHub", headers, token)
 
+    @staticmethod
+    def _repository(record: dict, org: str) -> SourceRepository:
+        owner = record["owner"]
+        if owner["login"].casefold() != org.casefold():
+            raise SyncError("GitHub returned a repository outside SOURCE_ORG.")
+        name = record["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise SyncError("GitHub returned an unsupported repository name.")
+        if type(record.get("private")) is not bool:
+            raise SyncError("GitHub did not return a valid repository privacy flag.")
+        visibility = record.get("visibility")
+        if visibility is not None and visibility not in ("public", "private", "internal"):
+            raise SyncError("GitHub returned an unknown repository visibility.")
+        # Internal GitHub repositories must never become public on GitLab.com.
+        private = record["private"] or visibility in ("private", "internal")
+        return SourceRepository(
+            int(record["id"]), int(owner["id"]), name,
+            f"{owner['login']}/{name}", record.get("default_branch"), private,
+        )
+
+    def organization_id(self, org: str) -> int:
+        return int(self.request("GET", f"/orgs/{quote(org, safe='')}")["id"])
+
     def repositories(self, org: str) -> list[SourceRepository]:
         records = self.pages(f"/orgs/{quote(org, safe='')}/repos", type="all", sort="full_name", direction="asc")
         repos = {}
         for record in records:
-            owner = record["owner"]
-            if owner["login"].casefold() != org.casefold():
-                raise SyncError("GitHub returned a repository outside SOURCE_ORG.")
-            name = record["name"]
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                raise SyncError("GitHub returned an unsupported repository name.")
-            repo = SourceRepository(
-                int(record["id"]), int(owner["id"]), name,
-                f"{owner['login']}/{name}", record.get("default_branch"), bool(record["private"]),
-            )
+            repo = self._repository(record, org)
             repos[repo.id] = repo
         return sorted(repos.values(), key=lambda repo: repo.full_name.casefold())
+
+    def repository(self, full_name: str) -> SourceRepository:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name):
+            raise SyncError("Invalid GitHub repository name.")
+        return self._repository(self.request("GET", f"/repos/{full_name}"), full_name.split("/", 1)[0])
 
     def automation_is_private(self, full_name: str) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name):
@@ -228,15 +258,37 @@ class GitLabAPI(ApiClient):
         })
 
     def prepare_project(self, project: dict, source: SourceRepository) -> dict:
+        # A mirror that has ingested private (or unknown legacy) history must
+        # not be published merely because its currently advertised refs match.
+        # GitLab can retain unreachable Git objects and cached commit content.
+        private_history = source.private or visibility_history(project) != "public-only"
         desired = {
-            "visibility": "private",
+            "visibility": "private" if private_history else project.get("visibility", "private"),
             "builds_access_level": "disabled",
             "auto_devops_enabled": False,
-            "description": project_description(source),
+            "description": project_description(source, private_history),
         }
         if all(project.get(key) == value for key, value in desired.items()):
             return project
-        return self.request("PUT", f"/projects/{project['id']}", body=desired)
+        project["visibility"] = "unknown"
+        updated = self.request("PUT", f"/projects/{project['id']}", body=desired)
+        if not isinstance(updated, dict) or updated.get("id") != project["id"] or updated.get("visibility") != desired["visibility"]:
+            raise SyncError("GitLab did not confirm the requested mirror visibility.")
+        project.update(updated)
+        return project
+
+    def set_visibility(self, project: dict, visibility: str) -> dict:
+        if visibility not in ("private", "public"):
+            raise SyncError("Unsupported mirror visibility.")
+        if project.get("visibility") != visibility:
+            # A timeout may occur after GitLab applied a write. Mark the local
+            # state unknown so failure handling sends a real private update.
+            project["visibility"] = "unknown"
+            updated = self.request("PUT", f"/projects/{project['id']}", body={"visibility": visibility})
+            if not isinstance(updated, dict) or updated.get("id") != project["id"] or updated.get("visibility") != visibility:
+                raise SyncError("GitLab did not confirm the requested mirror visibility.")
+            project.update(updated)
+        return project
 
     def unprotect(self, project_id: int):
         # Operate only on projects whose provenance was checked by SyncRunner.
@@ -403,18 +455,16 @@ class SyncRunner:
         # Complete discovery before modifying anything. A lost page cannot look
         # like a source repository deletion; whole projects are never deleted.
         sources = self.github.repositories(self.settings.source_org)
+        owner_id = self.github.organization_id(self.settings.source_org)
+        if any(source.owner_id != owner_id for source in sources):
+            raise SyncError("GitHub repository ownership does not match SOURCE_ORG.")
         sources = [source for source in sources if source.name.casefold() not in self.settings.exclude_repos
                    and source.full_name.casefold() not in self.settings.exclude_repos]
-        if any(source.private for source in sources) and os.environ.get("GITHUB_ACTIONS") == "true":
-            if not self.github.automation_is_private(os.environ.get("GITHUB_REPOSITORY", "")):
-                raise SyncError("Private sources require a private automation repository to keep repository names and logs private. Make the sync repository private before using GH_READ_TOKEN for private sources.")
         group = self.gitlab.group(self.settings.group_id)
         if group.get("id") != self.settings.group_id:
             raise SyncError("The GitLab group response does not match GITLAB_GROUP_ID.")
-        mode = "Dry run" if self.settings.dry_run else "Sync"
-        print(f"{mode}: {self.settings.source_org} → GitLab group "
-              f"{group.get('full_path', self.settings.group_id)} (ID {self.settings.group_id}); "
-              f"{len(sources)} accessible source repositories.", flush=True)
+        if group.get("visibility") not in ("public", "private", "internal"):
+            raise SyncError("GitLab did not return a valid destination group visibility.")
         projects = self.gitlab.projects(self.settings.group_id)
         by_key: dict[tuple[int, int], dict] = {}
         by_path = {}
@@ -428,35 +478,120 @@ class SyncRunner:
                 by_key[key] = project
             by_path[project["path"].casefold()] = project
         results = []
-        for source in sources:
+        blocked = {}
+        selected = {source.key: source for source in sources}
+        # Losing access to a newly-private source must not leave its old public
+        # mirror exposed. Retain absent/excluded managed projects privately.
+        # Do this before emitting names or rejecting public workflow logs.
+        for key, project in by_key.items():
+            source = selected.get(key)
+            if key[0] != owner_id or (source is not None and not source.private):
+                continue
+            if project.get("visibility") == "private":
+                continue
+            if self.settings.dry_run:
+                if source is None:
+                    results.append(Result(f"GitLab project {project['id']}", "would_retain_private",
+                                          "Source unavailable or excluded; retain the project privately"))
+                continue
             try:
-                project = by_key.get(source.key)
+                self.gitlab.set_visibility(project, "private")
+                if source is None:
+                    results.append(Result(f"GitLab project {project['id']}", "retained_private",
+                                          "Source unavailable or excluded; project retained privately"))
+            except (SyncError, OSError, KeyError, TypeError, ValueError) as exc:
+                blocked[key] = str(exc)
+                if source is None:
+                    results.append(Result(f"GitLab project {project['id']}", "failed",
+                                          "Could not confirm private visibility for an unavailable/excluded source. Check the destination group's Owner permissions and retry."))
+        if any(source.private for source in sources):
+            self._require_private_logs()
+        mode = "Dry run" if self.settings.dry_run else "Sync"
+        print(f"{mode}: {self.settings.source_org} → GitLab group "
+              f"{group.get('full_path', self.settings.group_id)} (ID {self.settings.group_id}); "
+              f"{len(sources)} accessible source repositories.", flush=True)
+        for result in results:
+            print(f"{result.repo}: {result.status} — {result.detail}", flush=True)
+        for source in sources:
+            project = by_key.get(source.key)
+            owned = project is not None  # Namespace and source key checked above.
+            try:
+                if source.key in blocked:
+                    raise SyncError(f"Cannot confirm this mirror is private: {blocked[source.key]}")
                 if project is None and source.name.casefold() in by_path:
                     raise SyncError("A GitLab project already occupies this path without the matching source ownership marker; refusing to overwrite it.")
                 if project is not None:
                     self._validate_project(project, source)
+                source = self._refresh_source(source)
+                if source.private:
+                    if owned and not self.settings.dry_run:
+                        self.gitlab.set_visibility(project, "private")
+                    self._require_private_logs()
+                elif group["visibility"] != "public":
+                    raise SyncError("Set the destination GitLab group visibility to Public to publish public source repositories.")
+                if project is not None and not source.private and visibility_history(project) != "public-only":
+                    raise SyncError("This mirror may retain private or unknown history. Keep it private and replace it with a fresh mirror to publish the now-public source; see the README.")
+                target_visibility = "private" if source.private else "public"
                 if self.settings.dry_run:
                     result = Result(source.full_name, "would_sync" if project else "would_create",
-                                    "Existing managed mirror" if project else "New private GitLab project")
+                                    f"{'Existing managed mirror' if project else 'New GitLab project'}; target visibility: {target_visibility}")
                 else:
                     if project is None:
                         project = self.gitlab.create_project(source, self.settings.group_id)
                         self._validate_project(project, source)
+                        owned = True
+                        self.gitlab.set_visibility(project, "private")
                         by_key[source.key] = project
                         by_path[project["path"].casefold()] = project
                     project = self.gitlab.prepare_project(project, source)
                     self._validate_project(project, source)
                     result = self._sync(source, project)
+                    visibility = self._finish_visibility(source, project, group)
+                    result = Result(result.repo, result.status, f"{result.detail}; visibility: {visibility}")
             except (SyncError, OSError, KeyError, TypeError, ValueError) as exc:
                 detail = redact(str(exc), self.settings.gitlab_token, self.settings.github_token)
+                if owned and not self.settings.dry_run:
+                    try:
+                        self.gitlab.set_visibility(project, "private")
+                    except (SyncError, OSError, KeyError, TypeError, ValueError) as privacy_error:
+                        detail += "; could not confirm private visibility: " + redact(
+                            str(privacy_error), self.settings.gitlab_token, self.settings.github_token)
                 result = Result(source.full_name, "failed", detail)
             results.append(result)
             print(f"{result.repo}: {result.status} — {result.detail}", flush=True)
         return results
 
+    def _require_private_logs(self):
+        if os.environ.get("GITHUB_ACTIONS") != "true":
+            return
+        if not hasattr(self, "_automation_private"):
+            self._automation_private = self.github.automation_is_private(os.environ.get("GITHUB_REPOSITORY", ""))
+        if not self._automation_private:
+            raise SyncError("Private sources require a private automation repository to keep repository names and logs private. Make the sync repository private before using GH_READ_TOKEN for private sources.")
+
+    def _refresh_source(self, source: SourceRepository) -> SourceRepository:
+        current = self.github.repository(source.full_name)
+        if current.key != source.key:
+            raise SyncError("The GitHub source identity changed during synchronization; retry after checking the source.")
+        return current
+
+    def _finish_visibility(self, source: SourceRepository, project: dict, group: dict) -> str:
+        current = self._refresh_source(source)
+        if current.private:
+            # This also permanently records private history before a future run
+            # could download the now-private source with authenticated Git.
+            self.gitlab.prepare_project(project, current)
+            return "private"
+        if group["visibility"] != "public":
+            raise SyncError("The GitLab group must be Public to publish public source repositories.")
+        if visibility_history(project) != "public-only":
+            raise SyncError("The source is now public, but this mirror may retain private history. Replace it with a fresh mirror before publishing; see the README.")
+        self.gitlab.set_visibility(project, "public")
+        return "public"
+
     def _sync(self, source: SourceRepository, project: dict) -> Result:
         with self.mirror_factory(source.clone_url, project["http_url_to_repo"],
-                                 self.settings.github_token, self.settings.gitlab_token) as mirror:
+                                 self.settings.github_token if source.private else "", self.settings.gitlab_token) as mirror:
             destination = mirror.destination_refs()
             if not mirror.refs:
                 if destination:
@@ -470,6 +605,9 @@ class SyncRunner:
                 raise SyncError("The source default branch changed during discovery; retry the sync.")
             if mirror.refs == destination and project.get("default_branch") == desired_default:
                 return Result(source.full_name, "unchanged", "Branches, tags, and default branch already match")
+            # Public mirrors remain public when unchanged, but transfers are
+            # staged privately until refs and fresh source visibility agree.
+            self.gitlab.set_visibility(project, "private")
             # LFS objects must arrive before refs: GitLab rejects missing objects.
             mirror.transfer_lfs()
             if (not mirror.refs
