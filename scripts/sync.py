@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import os
@@ -28,9 +29,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 class SyncError(Exception):
     """An actionable configuration, API, or Git synchronization failure."""
 
-    def __init__(self, message: str, *, code: str = "SYNC_FAILED"):
+    def __init__(self, message: str, *, code: str = "SYNC_FAILED", stage: str | None = None):
         super().__init__(message)
         self.code = code
+        self.stage = stage
 
 
 class ApiError(SyncError):
@@ -77,6 +79,34 @@ STATUS_MESSAGES = {
     "failed": "Synchronization failed.",
 }
 HTTP_FAILURE = re.compile(r"^(GITHUB|GITLAB)_HTTP_([1-5][0-9]{2})$")
+STAGES = frozenset({
+    "git_setup", "source_refs", "destination_refs", "source_fetch", "source_inspect",
+    "lfs_check", "lfs_scan", "lfs_fetch", "lfs_push", "refs_push", "refs_prune", "refs_verify",
+    "source_refresh", "project_create", "project_prepare", "visibility_update",
+    "protection_update", "default_branch_update", "git_transfer",
+})
+
+
+def safe_stage(stage: object) -> str:
+    return stage if isinstance(stage, str) and stage in STAGES else "unknown"
+
+
+def failure_stage(error: BaseException) -> str:
+    return safe_stage(error.stage) if isinstance(error, SyncError) else "unknown"
+
+
+@contextmanager
+def operation(stage: str):
+    """Attach a fixed operation label without exposing error text or inputs."""
+    try:
+        yield
+    except SyncError as exc:
+        if failure_stage(exc) == "unknown":
+            exc.stage = safe_stage(stage)
+        raise
+    except Exception:
+        raise SyncError("An unexpected error interrupted the operation.",
+                        code="UNEXPECTED_ERROR", stage=safe_stage(stage)) from None
 
 
 def safe_failure_code(code: object, fallback: str = "SYNC_FAILED") -> str:
@@ -171,6 +201,30 @@ MARKER = re.compile(r"^\[github-sync:v1 owner_id=(\d+) repository_id=(\d+)\]$", 
 VISIBILITY_MARKER = re.compile(
     r"^\[github-sync:visibility-v1 (public-only|private-history)\]$", re.MULTILINE
 )
+GITLAB_RESERVED_PROJECT_PATHS = frozenset({
+    "-", "badges", "blame", "blob", "builds", "commits", "create", "create_dir", "edit",
+    "environments/folders", "files", "find_file", "gitlab-lfs/objects", "info/lfs/objects",
+    "new", "preview", "raw", "refs", "tree", "update", "wikis",
+})
+
+
+def destination_name(source: SourceRepository) -> str:
+    """Keep compatible names; reserve an ID-based namespace for other sources.
+
+    GitLab rejects names such as .github for both project name and URL path.
+    Reserving github-repo-<digits> prevents a literal source name from colliding
+    with a fallback for a different source. Existing mirrors remain ID-tracked.
+    """
+    name = source.name
+    key = name.casefold()
+    if (len(name) <= 255 and re.fullmatch(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*", name)
+            and key not in GITLAB_RESERVED_PROJECT_PATHS
+            and not key.endswith((".git", ".atom"))
+            and not re.fullmatch(r"github-repo-[0-9]+", key)):
+        return name
+    if type(source.id) is not int or source.id <= 0:
+        raise SyncError("Invalid source repository ID for destination naming.", code="SOURCE_METADATA")
+    return f"github-repo-{source.id}"
 
 
 def source_marker(source: SourceRepository) -> str:
@@ -318,10 +372,11 @@ class GitLabAPI(ApiClient):
         return self.pages(f"/groups/{group_id}/projects", with_shared="false", include_subgroups="false")
 
     def create_project(self, source: SourceRepository, group_id: int) -> dict:
+        name = destination_name(source)
         return self.request("POST", "/projects", body={
             "namespace_id": group_id,
-            "name": source.name,
-            "path": source.name,
+            "name": name,
+            "path": name,
             "description": project_description(source),
             "visibility": "private",
             "initialize_with_readme": False,
@@ -448,7 +503,7 @@ class GitMirror:
         if self._temporary:
             self._temporary.cleanup()
 
-    def _git(self, *args: str, cwd: Path | None = None) -> str:
+    def _git(self, *args: str, cwd: Path | None = None, stage: str = "git_setup") -> str:
         command = ["git", "-c", "credential.helper=", "-c", f"core.hooksPath={os.devnull}",
                    "-c", "http.followRedirects=false", "-c", "protocol.ext.allow=never", *args]
         try:
@@ -456,16 +511,18 @@ class GitMirror:
                                      text=True, encoding="utf-8", errors="replace",
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
         except subprocess.TimeoutExpired:
-            raise SyncError("A Git operation exceeded the 30-minute timeout; it can be retried on the next run.", code="GIT_TIMEOUT") from None
+            raise SyncError("A Git operation exceeded the 30-minute timeout; it can be retried on the next run.",
+                            code="GIT_TIMEOUT", stage=stage) from None
         except OSError as exc:
-            raise SyncError(f"Could not run Git: {exc}", code="GIT_FAILED") from None
+            raise SyncError(f"Could not run Git: {exc}", code="GIT_FAILED", stage=stage) from None
         if process.returncode:
             detail = redact(process.stderr or process.stdout, self.github_token, self.gitlab_token)
-            raise SyncError(f"Git operation failed: {detail.strip()[-2500:]}", code="GIT_FAILED")
+            raise SyncError(f"Git operation failed: {detail.strip()[-2500:]}", code="GIT_FAILED", stage=stage)
         return process.stdout
 
-    def _remote_refs(self, remote: str) -> dict[str, str]:
-        output = self._git("ls-remote", "--refs", remote, "refs/heads/*", "refs/tags/*")
+    def _remote_refs(self, remote: str, stage: str | None = None) -> dict[str, str]:
+        stage = stage or ("source_refs" if remote == "github" else "destination_refs")
+        output = self._git("ls-remote", "--refs", remote, "refs/heads/*", "refs/tags/*", stage=stage)
         return {ref: sha for sha, ref in (line.split("\t", 1) for line in output.splitlines())}
 
     def destination_refs(self) -> dict[str, str]:
@@ -475,34 +532,37 @@ class GitMirror:
         if self._fetched:
             return
         self._git("fetch", "--quiet", "--force", "--prune", "--no-tags", "github",
-                  "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
-        output = self._git("for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/")
+                  "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", stage="source_fetch")
+        output = self._git("for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/",
+                           stage="source_inspect")
         self.refs = {ref: sha for sha, ref in (line.split(" ", 1) for line in output.splitlines())}
         self._fetched = True
 
     def transfer_lfs(self):
         self.fetch()
-        self._git("lfs", "version")
+        self._git("lfs", "version", stage="lfs_check")
         # No pointer files means no LFS network request. Scan history, not HEAD.
-        if not self._git("lfs", "ls-files", "--all").strip():
+        if not self._git("lfs", "ls-files", "--all", stage="lfs_scan").strip():
             return
         for remote, url, operation in (("github", self.source_url, "fetch"), ("gitlab", self.destination_url, "push")):
             endpoint = url.rstrip("/") + "/info/lfs"
             self._git("-c", f"lfs.url={endpoint}", "-c", f"lfs.pushurl={endpoint}",
                       "-c", f"remote.{remote}.lfsurl={endpoint}", "-c", f"remote.{remote}.lfspushurl={endpoint}",
                       "-c", "lfs.allowincompletepush=false", "-c", "lfs.skipdownloaderrors=false",
-                      "lfs", operation, "--all", remote)
+                      "lfs", operation, "--all", remote, stage="lfs_fetch" if operation == "fetch" else "lfs_push")
 
     def push_refs(self, prune: bool = False):
         self.fetch()
         args = ["push", "--atomic", "--force"]
         if prune:
             args.append("--prune")
-        self._git(*args, "gitlab", "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
+        self._git(*args, "gitlab", "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*",
+                  stage="refs_prune" if prune else "refs_push")
 
     def verify(self):
-        if self.destination_refs() != self.refs:
-            raise SyncError("Destination branches/tags differ from the fetched source snapshot after pushing.", code="VERIFY_FAILED")
+        if self._remote_refs("gitlab", stage="refs_verify") != self.refs:
+            raise SyncError("Destination branches/tags differ from the fetched source snapshot after pushing.",
+                            code="VERIFY_FAILED", stage="refs_verify")
 
 
 @dataclass(frozen=True)
@@ -512,6 +572,7 @@ class Result:
     detail: str
     visibility: str | None = None
     failure_code: str | None = None
+    stage: str | None = None
 
 
 def result_fields(result: Result) -> tuple[str, str, str]:
@@ -519,7 +580,9 @@ def result_fields(result: Result) -> tuple[str, str, str]:
     visibility = result.visibility if isinstance(result.visibility, str) and result.visibility in ("public", "private") else "unknown"
     if status == "failed":
         code = safe_failure_code(result.failure_code)
-        message = f"{code}: {failure_message(code)}"
+        stage = safe_stage(result.stage)
+        context = f" at {stage}" if stage != "unknown" else ""
+        message = f"{code}{context}: {failure_message(code)}"
     else:
         message = STATUS_MESSAGES[status]
     return status, visibility, message
@@ -602,7 +665,8 @@ class SyncRunner:
                                           "Source unavailable or excluded; retain the project privately", visibility="private"))
                 continue
             try:
-                self.gitlab.set_visibility(project, "private")
+                with operation("visibility_update"):
+                    self.gitlab.set_visibility(project, "private")
                 if source is None:
                     results.append(Result(f"GitLab project {project['id']}", "retained_private",
                                           "Source unavailable or excluded; project retained privately", visibility="private"))
@@ -611,7 +675,7 @@ class SyncRunner:
                 if source is None:
                     results.append(Result(f"GitLab project {project['id']}", "failed",
                                           "Could not confirm private visibility for an unavailable/excluded source.",
-                                          failure_code="PRIVACY_ROLLBACK_FAILED"))
+                                          failure_code="PRIVACY_ROLLBACK_FAILED", stage="visibility_update"))
         mode = "Dry run" if self.settings.dry_run else "Sync"
         print(f"{mode}: {len(sources)} accessible source repositories selected.", flush=True)
         for index, result in enumerate(results, 1):
@@ -622,14 +686,15 @@ class SyncRunner:
             try:
                 if source.key in blocked:
                     raise SyncError("Cannot confirm this mirror is private.", code="VISIBILITY_FAILED")
-                if project is None and source.name.casefold() in by_path:
+                if project is None and destination_name(source).casefold() in by_path:
                     raise SyncError("A GitLab project already occupies this path without the matching source ownership marker; refusing to overwrite it.", code="DESTINATION_CONFLICT")
                 if project is not None:
                     self._validate_project(project, source)
                 source = self._refresh_source(source)
                 if source.private:
                     if owned and not self.settings.dry_run:
-                        self.gitlab.set_visibility(project, "private")
+                        with operation("visibility_update"):
+                            self.gitlab.set_visibility(project, "private")
                 elif group["visibility"] != "public":
                     raise SyncError("Set the destination GitLab group visibility to Public to publish public source repositories.", code="PUBLIC_GROUP_REQUIRED")
                 if project is not None and not source.private and visibility_history(project) != "public-only":
@@ -641,19 +706,25 @@ class SyncRunner:
                                     visibility=target_visibility)
                 else:
                     if project is None:
-                        project = self.gitlab.create_project(source, self.settings.group_id)
-                        self._validate_project(project, source)
+                        with operation("project_create"):
+                            project = self.gitlab.create_project(source, self.settings.group_id)
+                            self._validate_project(project, source)
                         owned = True
-                        self.gitlab.set_visibility(project, "private")
+                        with operation("visibility_update"):
+                            self.gitlab.set_visibility(project, "private")
                         by_key[source.key] = project
                         by_path[project["path"].casefold()] = project
-                    project = self.gitlab.prepare_project(project, source)
-                    self._validate_project(project, source)
-                    result = self._sync(source, project)
-                    visibility = self._finish_visibility(source, project, group)
+                    with operation("project_prepare"):
+                        project = self.gitlab.prepare_project(project, source)
+                        self._validate_project(project, source)
+                    with operation("git_transfer"):
+                        result = self._sync(source, project)
+                    with operation("visibility_update"):
+                        visibility = self._finish_visibility(source, project, group)
                     result = Result(result.repo, result.status, f"{result.detail}; visibility: {visibility}", visibility=visibility)
             except Exception as exc:
                 code = failure_code(exc)
+                stage = failure_stage(exc)
                 visibility = None
                 if owned and not self.settings.dry_run:
                     try:
@@ -661,15 +732,18 @@ class SyncRunner:
                         visibility = "private"
                     except Exception:
                         code = "PRIVACY_ROLLBACK_FAILED"
-                result = Result(source.full_name, "failed", failure_message(code), visibility=visibility, failure_code=code)
+                        stage = "visibility_update"
+                result = Result(source.full_name, "failed", failure_message(code),
+                                visibility=visibility, failure_code=code, stage=stage)
             results.append(result)
             emit_result(result, len(results), self.show_repository_names)
         return results
 
     def _refresh_source(self, source: SourceRepository) -> SourceRepository:
-        current = self.github.repository(source.full_name)
-        if current.key != source.key:
-            raise SyncError("The GitHub source identity changed during synchronization; retry after checking the source.", code="SOURCE_CHANGED")
+        with operation("source_refresh"):
+            current = self.github.repository(source.full_name)
+            if current.key != source.key:
+                raise SyncError("The GitHub source identity changed during synchronization; retry after checking the source.", code="SOURCE_CHANGED")
         return current
 
     def _finish_visibility(self, source: SourceRepository, project: dict, group: dict) -> str:
@@ -677,13 +751,15 @@ class SyncRunner:
         if current.private:
             # This also permanently records private history before a future run
             # could download the now-private source with authenticated Git.
-            self.gitlab.prepare_project(project, current)
+            with operation("project_prepare"):
+                self.gitlab.prepare_project(project, current)
             return "private"
         if group["visibility"] != "public":
             raise SyncError("The GitLab group must be Public to publish public source repositories.", code="PUBLIC_GROUP_REQUIRED")
         if visibility_history(project) != "public-only":
             raise SyncError("The source is now public, but this mirror may retain private history. Replace it with a fresh mirror before publishing; see the README.", code="PRIVATE_HISTORY")
-        self.gitlab.set_visibility(project, "public")
+        with operation("visibility_update"):
+            self.gitlab.set_visibility(project, "public")
         return "public"
 
     def _sync(self, source: SourceRepository, project: dict) -> Result:
@@ -704,20 +780,24 @@ class SyncRunner:
                 return Result(source.full_name, "unchanged", "Branches, tags, and default branch already match")
             # Public mirrors remain public when unchanged, but transfers are
             # staged privately until refs and fresh source visibility agree.
-            self.gitlab.set_visibility(project, "private")
+            with operation("visibility_update"):
+                self.gitlab.set_visibility(project, "private")
             # LFS objects must arrive before refs: GitLab rejects missing objects.
             mirror.transfer_lfs()
             if (not mirror.refs
                     or has_branches != any(ref.startswith("refs/heads/") for ref in mirror.refs)
                     or (desired_default and f"refs/heads/{desired_default}" not in mirror.refs)):
                 raise SyncError("Source refs changed during fetch; retry the sync before updating GitLab.", code="SOURCE_CHANGED")
-            self.gitlab.unprotect(project["id"])
+            with operation("protection_update"):
+                self.gitlab.unprotect(project["id"])
             mirror.push_refs(prune=False)
             # GitLab never permits deleting its current default branch. Install
             # the new one first, switch the setting, then prune obsolete refs.
             if desired_default and project.get("default_branch") != desired_default:
-                self.gitlab.set_default_branch(project["id"], desired_default)
-            self.gitlab.unprotect(project["id"])
+                with operation("default_branch_update"):
+                    self.gitlab.set_default_branch(project["id"], desired_default)
+            with operation("protection_update"):
+                self.gitlab.unprotect(project["id"])
             mirror.push_refs(prune=True)
             mirror.verify()
             return Result(source.full_name, "synced", f"Verified {len(mirror.refs)} branches and tags")
@@ -763,7 +843,9 @@ def main(argv=None) -> int:
         return 1 if any(result.status == "failed" for result in results) else 0
     except (Exception, KeyboardInterrupt) as exc:
         code = failure_code(exc)
-        print(f"Sync failed [{code}]: {failure_message(code)}", file=sys.stderr)
+        stage = failure_stage(exc)
+        context = f" at {stage}" if stage != "unknown" else ""
+        print(f"Sync failed [{code}{context}]: {failure_message(code)}", file=sys.stderr)
         return 1
 
 

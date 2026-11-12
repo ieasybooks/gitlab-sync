@@ -14,6 +14,7 @@ from scripts.sync import (
     SourceRepository,
     SyncError,
     SyncRunner,
+    destination_name,
     project_description,
     source_marker,
     visibility_history,
@@ -95,7 +96,8 @@ class RecordingGitLab:
 
     def create_project(self, repository, group_id):
         self.events.append(("create", repository.id))
-        created = project(repository, project_id=100 + repository.id, namespace_id=group_id)
+        created = project(repository, project_id=100 + repository.id,
+                          path=destination_name(repository), namespace_id=group_id)
         self.created_projects.append(deepcopy(created))
         self.values.append(created)
         return created
@@ -215,6 +217,73 @@ class SyncRunnerTests(unittest.TestCase):
         self.assertEqual([result.status for result in results], ["failed"])
         self.assertEqual(self.events, [])
         self.assertEqual(self.factory_calls, [])
+
+    def test_new_fallback_destination_keeps_the_original_github_remote_and_aliased_output(self):
+        repository = source(".github", repository_id=10)
+        results = self.run_sync([repository])
+        self.assertEqual([result.status for result in results], ["synced"])
+        created = self.gitlab.created_projects[0]
+        self.assertEqual((created["name"], created["path"]), ("github-repo-10", "github-repo-10"))
+        args, _ = self.factory_calls[0]
+        self.assertEqual(args[:2], (
+            "https://github.com/ieasybooks/.github.git",
+            "https://gitlab.com/mirrors/github-repo-10.git",
+        ))
+        self.assertIn("repo-001:", self.output.getvalue())
+        self.assertNotIn(repository.full_name, self.output.getvalue())
+        self.assertNotIn("github-repo-10", self.output.getvalue())
+
+    def test_unmanaged_fallback_path_is_never_overwritten_in_dry_or_live_runs(self):
+        repository = source(".github", repository_id=10)
+        unmanaged = project(repository, path="github-repo-10")
+        unmanaged["description"] = "Maintained by a human"
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.events.clear()
+                self.factory_calls.clear()
+                results = self.run_sync(
+                    [repository], [unmanaged], settings=replace(self.settings, dry_run=dry_run),
+                )
+                self.assertEqual([result.status for result in results], ["failed"])
+                self.assertEqual(results[0].failure_code, "DESTINATION_CONFLICT")
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.factory_calls, [])
+                self.assertEqual(self.gitlab.values, [unmanaged])
+
+    def test_reserved_fallback_namespace_keeps_two_source_identities_distinct(self):
+        repositories = [
+            source("github-repo-10", repository_id=11),
+            source(".github", repository_id=10),
+        ]
+        results = self.run_sync(repositories)
+        self.assertEqual([result.status for result in results], ["synced", "synced"])
+        paths = [value["path"] for value in self.gitlab.created_projects]
+        self.assertEqual(paths, ["github-repo-11", "github-repo-10"])
+        self.assertEqual(len(set(paths)), 2)
+
+    def test_existing_managed_fallback_is_reused_before_and_after_source_rename(self):
+        original = source(".github", repository_id=10)
+        existing = project(original, path="github-repo-10")
+        for name in (".github", "renamed-tools"):
+            with self.subTest(name=name):
+                self.events.clear()
+                self.factory_calls.clear()
+                repository = source(name, repository_id=10)
+                results = self.run_sync([repository], [existing])
+                self.assertEqual([result.status for result in results], ["synced"])
+                self.assertEqual(self.gitlab.created_projects, [])
+                args, _ = self.factory_calls[0]
+                self.assertEqual(args[0], f"https://github.com/ieasybooks/{name}.git")
+                self.assertEqual(args[1], "https://gitlab.com/mirrors/github-repo-10.git")
+
+    def test_existing_source_in_reserved_namespace_keeps_its_legacy_destination_path(self):
+        repository = source("github-repo-10", repository_id=11)
+        existing = project(repository, path="github-repo-10")
+        results = self.run_sync([repository], [existing])
+        self.assertEqual([result.status for result in results], ["synced"])
+        self.assertEqual(self.gitlab.created_projects, [])
+        args, _ = self.factory_calls[0]
+        self.assertEqual(args[1], "https://gitlab.com/mirrors/github-repo-10.git")
 
     def test_recreated_source_cannot_take_over_the_old_repository_mirror(self):
         original = source(repository_id=10)

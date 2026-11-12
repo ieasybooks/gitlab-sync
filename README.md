@@ -99,6 +99,8 @@ Public source Git and LFS transfers use anonymous access; GitHub API discovery s
 
 The automation marks each created project's description with its GitHub source identity. It will only update projects it recognizes as its own mirrors, and it refuses to overwrite an unrelated existing project with the same path. Keep that identity marker in the destination description.
 
+GitLab has stricter project-name and URL-path rules than GitHub. Compatible source names keep their original destination name. Incompatible or reserved names, such as `.github`, use `github-repo-<GitHub repository ID>` for both the GitLab name and path. That pattern is reserved for generated destinations, so a source literally named `github-repo-123` also maps by its own ID instead of colliding with another mirror. The description retains the original GitHub URL. Existing managed projects continue to be found by source identity and keep their current paths, including after source renames.
+
 New mirrors start private. Changed public mirrors are temporarily made private while data is transferred, then published only after a successful sync and a fresh GitHub identity/visibility check. Unchanged public mirrors stay public. Private and internal sources remain private, and a per-repository failure keeps or returns the managed mirror to private. Excluded or undiscovered managed mirrors are also retained as private projects.
 
 The project description permanently records private source history before any private data transfer. Changing the source from private to public does not publish that existing mirror, even if its current refs match. Older mirrors without a visibility history marker are treated the same way. These cases remain private and report that a fresh destination is required, because GitLab can retain objects that are no longer referenced by current branches or tags.
@@ -119,7 +121,7 @@ Do not use a mirror for independent GitLab development: its branches and tags ca
 
 - **Scheduling:** GitHub Actions schedules can be delayed or dropped during high load. Scheduled workflows in a public repository are also disabled after 60 days without repository activity. Monitor the workflow and re-enable it if GitHub disables it; this repository does not create automatic heartbeat commits.
 - **Concurrency:** One sync run executes at a time. Starting another run does not cancel the active transfer.
-- **Failures:** Check the failed Actions run for the affected repository alias and error code. A repository failure is recorded while other repositories continue; any failure makes the run unsuccessful. Use local named output when you need to identify a repository, then resolve the cause and rerun the workflow; existing managed projects are reused. Configure your GitHub Actions notification preferences to receive workflow failure notifications.
+- **Failures:** Check the failed Actions run for the affected repository alias, error code, and operation stage. A repository failure is recorded while other repositories continue; any failure makes the run unsuccessful. Use local named output when you need to identify a repository, then resolve the cause and rerun the workflow; existing managed projects are reused. Configure your GitHub Actions notification preferences to receive workflow failure notifications.
 - **Authentication errors:** Check token expiration, the selected GitHub repositories, any organization token approvals, and the GitLab account's access to the group. Replace expired tokens in the corresponding GitHub secret.
 - **Existing project collision:** Use a clean destination group or rename the unrelated GitLab project. The script deliberately does not adopt unrelated projects.
 - **Public visibility rejected:** Confirm that the destination group is Public and the token's account can manage project visibility. The script reports restrictions and keeps the affected mirror private rather than changing group-wide settings.
@@ -133,6 +135,8 @@ The sync does not require paid GitLab pull mirroring or a workflow file in each 
 ### Logs and local diagnosis
 
 By default, each repository is represented by an alias such as `repo-001`. These aliases are assigned per run and are not stable identifiers. Default script output and all job summaries contain fixed status/error messages, visibility, and counts rather than private repository names, repository IDs, paths, URLs, refs, content, credentials, raw API/Git errors, or tracebacks. The workflow does not upload private repository data as artifacts or cache it between runs.
+
+Failures include a fixed operation label when known, for example `GITLAB_HTTP_400 at project_create` or `GIT_FAILED at refs_push`. Git diagnostics distinguish source/destination ref reads, source fetch, LFS inspection/download/upload, ref push/prune, and final verification. API diagnostics distinguish project creation/preparation, visibility, protection, and default-branch updates. These labels identify the failed operation; they do not reveal the remote's raw rejection message or establish its exact cause. No command arguments or remote payloads are printed.
 
 Public logs still reveal counts, statuses, visibility states, and timing. GitHub also displays its own run metadata and the public organization/group configuration described above. Aliased output does not conceal those facts.
 
